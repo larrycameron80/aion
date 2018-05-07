@@ -137,10 +137,12 @@ public class AionHub {
         this.startingBlock = this.blockchain.getBestBlock();
         if (!cfg.getConsensus().isSeed()) {
             this.mempool.updateBest();
-        }
 
-        if (cfg.getTx().getPoolBackup()) {
-            this.mempool.loadPendingTx();
+            if (cfg.getTx().getPoolBackup()) {
+                this.mempool.loadPendingTx();
+            }
+        } else {
+            LOG.info("Seed node mode enabled!");
         }
 
 		String reportsFolder = "";
@@ -254,6 +256,7 @@ public class AionHub {
 
     private void loadBlockchain() {
 
+        // function repurposed for integrity checks since previously not implemented
         this.repository.getBlockStore().load();
 
         AionBlock bestBlock = this.repository.getBlockStore().getBestBlock();
@@ -271,7 +274,7 @@ public class AionHub {
             long bestBlockNumber = bestBlock.getNumber();
             byte[] bestBlockRoot = bestBlock.getStateRoot();
 
-            recovered = this.blockchain.recoverWorldState(this.repository, bestBlockNumber);
+            recovered = this.blockchain.recoverWorldState(this.repository, bestBlock);
 
             if (recovered) {
                 bestBlock = this.repository.getBlockStore().getBestBlock();
@@ -377,7 +380,7 @@ public class AionHub {
             this.repository.syncToRoot(blockchain.getBestBlock().getStateRoot());
         }
 
-        this.repository.getBlockStore().load();
+//        this.repository.getBlockStore().load();
     }
 
     public void close() {

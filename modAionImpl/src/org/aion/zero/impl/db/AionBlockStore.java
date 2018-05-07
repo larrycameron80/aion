@@ -55,6 +55,7 @@ import static org.aion.crypto.HashUtil.shortHash;
 public class AionBlockStore extends AbstractPowBlockstore<AionBlock, A0BlockHeader> {
 
     private static final Logger LOG = AionLoggerFactory.getLogger(LogEnum.DB.name());
+    private static final Logger LOG_CONS = AionLoggerFactory.getLogger(LogEnum.CONS.name());
 
     protected ReadWriteLock lock = new ReentrantReadWriteLock();
 
@@ -63,8 +64,15 @@ public class AionBlockStore extends AbstractPowBlockstore<AionBlock, A0BlockHead
     private IByteArrayKeyValueDatabase blocksDS;
     private ObjectDataSource<AionBlock> blocks;
 
+    private boolean checkIntegrity = true;
+
     public AionBlockStore(IByteArrayKeyValueDatabase index, IByteArrayKeyValueDatabase blocks) {
         init(index, blocks);
+    }
+
+    public AionBlockStore(IByteArrayKeyValueDatabase index, IByteArrayKeyValueDatabase blocks, boolean checkIntegrity) {
+        this(index, blocks);
+        this.checkIntegrity = checkIntegrity;
     }
 
     private void init(IByteArrayKeyValueDatabase index, IByteArrayKeyValueDatabase blocks) {
@@ -232,6 +240,10 @@ public class AionBlockStore extends AbstractPowBlockstore<AionBlock, A0BlockHead
 
             List<BlockInfo> blockInfos = index.get(number);
 
+            if (blockInfos == null) {
+                return null;
+            }
+
             for (BlockInfo blockInfo : blockInfos) {
                 if (blockInfo.isMainChain()) {
                     byte[] hash = blockInfo.getHash();
@@ -296,7 +308,10 @@ public class AionBlockStore extends AbstractPowBlockstore<AionBlock, A0BlockHead
             }
 
             Long level = block.getNumber();
-            List<BlockInfo> blockInfos = index.get(level.intValue());
+            List<BlockInfo> blockInfos = index.get(level.longValue());
+            if (blockInfos == null){
+                return ZERO;
+            }
             for (BlockInfo blockInfo : blockInfos) {
                 if (Arrays.equals(blockInfo.getHash(), hash)) {
                     return blockInfo.getCummDifficulty();
@@ -690,6 +705,50 @@ public class AionBlockStore extends AbstractPowBlockstore<AionBlock, A0BlockHead
         }
     }
 
+    public BigInteger correctIndexEntry(AionBlock block, BigInteger parentTotalDifficulty) {
+        lock.writeLock().lock();
+
+        try {
+            long blockNumber = block.getNumber();
+            List<BlockInfo> levelBlocks = getBlockInfoForLevel(blockNumber);
+            if (levelBlocks == null) {
+                levelBlocks = new ArrayList<>();
+            }
+
+            // correct block info
+            BlockInfo blockInfo = getBlockInfoForHash(levelBlocks, block.getHash());
+            if (blockInfo == null) {
+                blockInfo = new BlockInfo();
+            }
+            blockInfo.setHash(block.getHash());
+            blockInfo.setCummDifficulty(block.getDifficultyBI().add(parentTotalDifficulty));
+            // assuming side chain, with warnings upon encountered issues
+            blockInfo.setMainChain(false);
+
+            // looking through the other block info on that level
+            List<BlockInfo> mainChain = new ArrayList<>();
+            for (BlockInfo bi : levelBlocks) {
+                if (bi.isMainChain()) {
+                    mainChain.add(bi);
+                }
+            }
+
+            // ensuring that there exists only one main chain at present
+            if (mainChain.size() > 1) {
+                LOG.error("The database is corrupted. There are two different main chain blocks at level {}."
+                                  + " Please stop the kernel and repair the block information by executing:\t./aion.sh -r",
+                          blockNumber);
+            }
+
+            levelBlocks.add(blockInfo);
+            setBlockInfoForLevel(blockNumber, levelBlocks);
+
+            return blockInfo.getCummDifficulty();
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
     public void dumpPastBlocks(long numberOfBlocks, String reportsFolder) throws IOException {
         lock.readLock().lock();
 
@@ -708,12 +767,13 @@ public class AionBlockStore extends AbstractPowBlockstore<AionBlock, A0BlockHead
                 writer.newLine();
 
                 for (BlockInfo bi : levelBlocks) {
-                    writer.append("Block hash from index database: " + Hex.toHexString(bi.getHash()) + "\nTotal Difficulty: " + bi
-                            .getCummDifficulty());
+                    writer.append("\nBlock hash from index database: " + Hex.toHexString(bi.getHash())
+                                          + "\nTotal Difficulty: " + bi.getCummDifficulty() + "\nBlock on main chain: "
+                                          + String.valueOf(bi.isMainChain()).toUpperCase());
                     writer.newLine();
                     AionBlock blk = getBlockByHash(bi.getHash());
                     if (blk != null) {
-                        writer.append("Full block data:\n");
+                        writer.append("\nFull block data:\n");
                         writer.append(blk.toString());
                         writer.newLine();
                     } else {
@@ -756,6 +816,17 @@ public class AionBlockStore extends AbstractPowBlockstore<AionBlock, A0BlockHead
             maxBlocks -= i;
 
             return result;
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    public boolean isIndexed(byte[] hash, long level) {
+        lock.readLock().lock();
+
+        try {
+            // when null -> there was no block info for the hash
+            return getBlockInfoForHash(getBlockInfoForLevel(level), hash) != null;
         } finally {
             lock.readLock().unlock();
         }
@@ -931,6 +1002,8 @@ public class AionBlockStore extends AbstractPowBlockstore<AionBlock, A0BlockHead
      * @implNote The method calling this method must handle the locking.
      */
     private static BlockInfo getBlockInfoForHash(List<BlockInfo> blocks, byte[] hash) {
+        if (blocks == null)
+            return null;
         for (BlockInfo blockInfo : blocks) {
             if (Arrays.equals(hash, blockInfo.getHash())) {
                 return blockInfo;
@@ -941,6 +1014,100 @@ public class AionBlockStore extends AbstractPowBlockstore<AionBlock, A0BlockHead
 
     @Override
     public void load() {
+        if (checkIntegrity) {
+            indexIntegrityCheck();
+        }
+    }
+
+    public enum IntegrityCheckResult {
+        MISSING_GENESIS,
+        MISSING_LEVEL,
+        FIXED,
+        CORRECT
+    }
+
+    public IntegrityCheckResult indexIntegrityCheck() {
+        if (index.size() > 0) {
+            LOG_CONS.info("Checking the integrity of the total difficulty information...");
+
+            // check each block's total difficulty till genesis
+            boolean correct = true;
+            AionBlock block = getBestBlock();
+            while (correct && block.getNumber() > 0) {
+                // it is correct if there is no inconsistency wrt to the parent
+                correct = getTotalDifficultyForHash(block.getHash())
+                        .equals(getTotalDifficultyForHash(block.getParentHash()).add(block.getDifficultyBI()));
+                LOG_CONS.info("Total difficulty for block hash: {} number: {} is {}.",
+                              block.getShortHash(),
+                              block.getNumber(),
+                              correct ? "OK" : "NOT OK");
+                // check parent next
+                block = getBlockByHash(block.getParentHash());
+            }
+
+            // check correct TD for genesis block
+            if (block.getNumber() == 0) {
+                correct = getTotalDifficultyForHash(block.getHash()).equals(block.getDifficultyBI());
+                LOG_CONS.info("Total difficulty for block hash: {} number: {} is {}.",
+                              block.getShortHash(),
+                              block.getNumber(),
+                              correct ? "OK" : "NOT OK");
+            }
+
+            // if any inconsistency, correct the TD
+            if (!correct) {
+                LOG_CONS.info("Integrity check of total difficulty found INVALID information. Correcting ...");
+
+                List<BlockInfo> infos = getBlockInfoForLevel(0);
+                if (infos == null) {
+                    LOG_CONS.error("Missing genesis block information. Cannot recover without deleting database.");
+                    return IntegrityCheckResult.MISSING_GENESIS;
+                }
+
+                for (BlockInfo bi : infos) {
+                    block = getBlockByHash(bi.getHash());
+                    bi.setCummDifficulty(block.getDifficultyBI());
+                    LOG_CONS.info("Correcting total difficulty for block hash: {} number: {} to {}.",
+                                  block.getShortHash(),
+                                  block.getNumber(),
+                                  bi.getCummDifficulty());
+                }
+                setBlockInfoForLevel(0, infos);
+
+                long level = 1;
+
+                do {
+                    infos = getBlockInfoForLevel(level);
+                    if (infos == null) {
+                        LOG_CONS.error("Missing block information at level {}."
+                                               + " Cannot recover without reverting to block number {}.",
+                                       level,
+                                       (level - 1));
+                        return IntegrityCheckResult.MISSING_LEVEL;
+                    }
+
+                    for (BlockInfo bi : infos) {
+                        block = getBlockByHash(bi.getHash());
+                        bi.setCummDifficulty(block.getDifficultyBI()
+                                                     .add(getTotalDifficultyForHash(block.getParentHash())));
+                        LOG_CONS.info("Correcting total difficulty for block hash: {} number: {} to {}.",
+                                      block.getShortHash(),
+                                      block.getNumber(),
+                                      bi.getCummDifficulty());
+                    }
+                    setBlockInfoForLevel(level, infos);
+
+                    level++;
+                } while (level < index.size());
+
+                LOG_CONS.info("Total difficulty correction COMPLETE.");
+                return IntegrityCheckResult.FIXED;
+            } else {
+                return IntegrityCheckResult.CORRECT;
+            }
+        } else {
+            return IntegrityCheckResult.CORRECT;
+        }
     }
 
     @Override
