@@ -1109,8 +1109,10 @@ public class AionBlockchainImpl implements IAionBlockchain {
         return pubBestTD;
     }
 
-    // this method is for the testing purpose
-    protected BigInteger getCacheTD() {
+    /*
+     * this method is for the testing purpose, do not use in other place.
+     */
+    BigInteger getCacheTD() {
         return totalDifficulty;
     }
 
